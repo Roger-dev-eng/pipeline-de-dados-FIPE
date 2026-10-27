@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -53,14 +54,13 @@ def render_page_style():
             }
 
             [data-testid="stSidebar"] {
-                background: #f8fafc;
-                border-right: 1px solid #e5e7eb;
+                border-right: 1px solid color-mix(in srgb, currentColor 18%, transparent);
             }
 
             .page-header {
                 padding: 0.2rem 0 1.1rem 0;
-                border-bottom: 1px solid #e5e7eb;
-                color: #0f172a;
+                border-bottom: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+                color: inherit;
                 margin-bottom: 1.1rem;
             }
 
@@ -73,20 +73,22 @@ def render_page_style():
 
             .page-header p {
                 margin: 0;
-                color: #475569;
+                color: inherit;
+                opacity: 0.75;
                 font-size: 0.98rem;
             }
 
             .kpi-card {
-                border: 1px solid #e5e7eb;
+                border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
                 border-radius: 8px;
-                background: #ffffff;
+                background: transparent;
                 padding: 1rem 1.05rem;
                 min-height: 104px;
             }
 
             .kpi-label {
-                color: #64748b;
+                color: inherit;
+                opacity: 0.7;
                 font-size: 0.78rem;
                 font-weight: 700;
                 letter-spacing: 0.04em;
@@ -95,7 +97,7 @@ def render_page_style():
             }
 
             .kpi-value {
-                color: #0f172a;
+                color: inherit;
                 font-size: 1.55rem;
                 font-weight: 760;
                 line-height: 1.15;
@@ -103,17 +105,17 @@ def render_page_style():
             }
 
             .section-title {
-                color: #0f172a;
+                color: inherit;
                 font-size: 1.05rem;
                 font-weight: 720;
                 margin: 0.3rem 0 0.65rem 0;
             }
 
             div[data-testid="stMetric"] {
-                border: 1px solid #e5e7eb;
+                border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
                 border-radius: 8px;
                 padding: 1rem;
-                background: #ffffff;
+                background: transparent;
             }
         </style>
         """,
@@ -191,12 +193,22 @@ def apply_filters(df):
 
         base = df[df["marca"].isin(selected_brands)] if selected_brands else df
 
+        model_search = st.text_input(
+            "Buscar modelo",
+            placeholder="Ex.: Corolla",
+            help="Busca parte do nome, sem diferenciar maiusculas de minusculas.",
+        ).strip()
+
         fuels = sorted(base["combustivel"].dropna().unique())
         selected_fuels = st.multiselect("Combustivel", fuels, default=fuels)
 
         min_year = int(base["ano_modelo"].min())
         max_year = int(base["ano_modelo"].max())
-        selected_years = st.slider("Ano modelo", min_year, max_year, (min_year, max_year))
+        if min_year == max_year:
+            st.caption(f"Ano modelo: {min_year}")
+            selected_years = (min_year, max_year)
+        else:
+            selected_years = st.slider("Ano modelo", min_year, max_year, (min_year, max_year))
 
         max_rows = st.number_input("Linhas na tabela", min_value=10, max_value=500, value=100, step=10)
 
@@ -204,6 +216,10 @@ def apply_filters(df):
         base["combustivel"].isin(selected_fuels)
         & base["ano_modelo"].between(selected_years[0], selected_years[1])
     ]
+    if model_search:
+        filtered = filtered[
+            filtered["modelo"].str.contains(model_search, case=False, regex=False, na=False)
+        ]
     return filtered, max_rows
 
 
@@ -231,6 +247,12 @@ def render_pipeline_action():
             )
 
         if not run_pipeline:
+            if "last_pipeline_summary" in st.session_state:
+                st.caption(
+                    "Ultima coleta concluida nesta sessao: "
+                    + st.session_state["last_pipeline_completed_at"]
+                )
+                render_pipeline_summary(st.session_state["last_pipeline_summary"])
             return
 
         from app.pipeline.fipe_import import importar_dados_fipe
@@ -250,12 +272,17 @@ def render_pipeline_action():
 
         with st.status("Pipeline em execucao", expanded=True) as status:
             summary = importar_dados_fipe(limite_registros=int(limit), progress_callback=on_progress)
-            st.cache_data.clear()
+            cached_data.clear()
             status.update(label="Pipeline concluido", state="complete")
 
-        st.success("Coleta concluida. Os dados foram atualizados no banco.")
+        completed_at = datetime.now(timezone(timedelta(hours=-3))).strftime(
+            "%d/%m/%Y as %H:%M:%S (Brasilia)"
+        )
+        st.session_state["last_pipeline_summary"] = summary
+        st.session_state["last_pipeline_completed_at"] = completed_at
+        st.success("Coleta concluida. O painel foi atualizado com os dados disponiveis no banco.")
+        st.caption("Ultima coleta concluida nesta sessao: " + completed_at)
         render_pipeline_summary(summary)
-        st.caption("Recarregue a pagina ou altere algum filtro para atualizar os graficos com os dados mais recentes.")
 
 
 def render_empty_state():
@@ -280,7 +307,20 @@ def main():
         render_empty_state()
         return
 
+    latest_update = pd.to_datetime(df["data_consulta"], errors="coerce").max()
+    if pd.notna(latest_update):
+        st.caption(
+            "Ultima atualizacao dos dados: "
+            + latest_update.strftime("%d/%m/%Y")
+            + " (data de insercao mais recente no banco)."
+        )
+    else:
+        st.caption("Ultima atualizacao dos dados: data indisponivel.")
+
     df = df.dropna(subset=["valor", "ano_modelo"]).copy()
+    if df.empty:
+        render_empty_state()
+        return
     df["ano_modelo"] = df["ano_modelo"].astype(int)
 
     filtered, max_rows = apply_filters(df)

@@ -7,11 +7,10 @@ COLOR_SEQUENCE = ["#2563eb", "#059669", "#ea580c", "#7c3aed", "#dc2626", "#0891b
 def apply_chart_layout(fig, height):
     fig.update_layout(
         height=height,
-        template="plotly_white",
         margin={"l": 8, "r": 8, "t": 20, "b": 8},
         font={"family": "Inter, Segoe UI, sans-serif", "size": 13},
         hoverlabel={"font_size": 13},
-        xaxis={"showgrid": True, "gridcolor": "#e5e7eb", "zeroline": False},
+        xaxis={"showgrid": True, "zeroline": False},
         yaxis={"showgrid": False, "zeroline": False},
     )
     return fig
