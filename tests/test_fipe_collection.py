@@ -2,7 +2,7 @@ import importlib
 import sys
 import types
 from concurrent.futures import Future, ThreadPoolExecutor
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -14,8 +14,9 @@ def collection(monkeypatch):
     monkeypatch.setenv("FIPE_CACHE_PATH", "unused-test-cache.json")
     database = types.ModuleType("app.db.engine")
     database.engine = Mock()
-    with patch.dict(sys.modules, {"app.db.engine": database}):
-        module = importlib.import_module("app.pipeline.fipe_import")
+    # Patch only the database entry so pandas/NumPy stay loaded between tests.
+    monkeypatch.setitem(sys.modules, "app.db.engine", database)
+    module = importlib.import_module("app.pipeline.fipe_import")
     monkeypatch.setattr(module, "_save_cache", Mock())
     monkeypatch.setattr(module, "_cache", {})
     monkeypatch.setattr(module, "_MAX_WORKERS", 2)
