@@ -21,9 +21,11 @@ _cache_lock = threading.Lock()
 _thread_local = threading.local()
 
 retry_strategy = Retry(
-    total=3,
+    total=2,
     backoff_factor=0.3,
-    status_forcelist=[429, 500, 502, 503, 504]
+    status_forcelist=[500, 502, 503, 504],
+    # Report rate limits immediately instead of sleeping invisibly for Retry-After.
+    respect_retry_after_header=False,
 )
 
 
@@ -89,6 +91,33 @@ def _emit(progress_callback, event, message, **data):
         })
 
 
+def _request_json(url):
+    resposta = _get_session().get(url, timeout=_TIMEOUT)
+    if resposta.status_code == 429:
+        retry_after = resposta.headers.get("Retry-After")
+        hint = f" Prazo informado pela API (Retry-After): {retry_after}." if retry_after else ""
+        raise RuntimeError(
+            "A API FIPE limitou as consultas (HTTP 429). "
+            "Aguarde antes de iniciar outra coleta." + hint
+        )
+    resposta.raise_for_status()
+    return resposta.json()
+
+
+def _await_api(executor, operation, args, registros, limite, progress_callback):
+    future = executor.submit(operation, *args)
+    while True:
+        done, _ = wait([future], timeout=2, return_when=FIRST_COMPLETED)
+        if done:
+            return future.result()
+        _emit(
+            progress_callback, "api_wait",
+            f"Aguardando API FIPE: {operation.__name__} {args}; "
+            f"{len(registros)}/{limite} registros coletados",
+            current=len(registros), total=limite,
+        )
+
+
 
 def obter_marcas():
     url = "https://parallelum.com.br/fipe/api/v1/carros/marcas"
@@ -97,17 +126,14 @@ def obter_marcas():
     if cached is not None:
         return cached
     try:
-        resposta = _get_session().get(url, timeout=_TIMEOUT)
-        resposta.raise_for_status()
-        dados = resposta.json()
+        dados = _request_json(url)
         if isinstance(dados, list) and all(isinstance(m, dict) for m in dados):
             _cache_set(cache_key, dados)
             return dados
         print(" Retorno inesperado da API de marcas.")
         return []
     except Exception as e:
-        print(f" Erro ao obter marcas: {e}")
-        return []
+        raise RuntimeError(f"Erro ao obter marcas: {e}") from e
 
 
 
@@ -118,14 +144,11 @@ def obter_modelos(codigo_marca):
     if cached is not None:
         return cached
     try:
-        resposta = _get_session().get(url, timeout=_TIMEOUT)
-        resposta.raise_for_status()
-        dados = resposta.json().get("modelos", [])
+        dados = _request_json(url).get("modelos", [])
         _cache_set(cache_key, dados)
         return dados
     except Exception as e:
-        print(f" Erro ao obter modelos da marca {codigo_marca}: {e}")
-        return []
+        raise RuntimeError(f"Erro ao obter modelos da marca {codigo_marca}: {e}") from e
 
 
 
@@ -136,14 +159,11 @@ def obter_anos(codigo_marca, codigo_modelo):
     if cached is not None:
         return cached
     try:
-        resposta = _get_session().get(url, timeout=_TIMEOUT)
-        resposta.raise_for_status()
-        dados = resposta.json()
+        dados = _request_json(url)
         _cache_set(cache_key, dados)
         return dados
     except Exception as e:
-        print(f" Erro ao obter anos [{codigo_marca}/{codigo_modelo}]: {e}")
-        return []
+        raise RuntimeError(f"Erro ao obter anos [{codigo_marca}/{codigo_modelo}]: {e}") from e
 
 
 
@@ -154,14 +174,11 @@ def obter_detalhes(codigo_marca, codigo_modelo, codigo_ano):
     if cached is not None:
         return cached
     try:
-        resposta = _get_session().get(url, timeout=_TIMEOUT)
-        resposta.raise_for_status()
-        dados = resposta.json()
+        dados = _request_json(url)
         _cache_set(cache_key, dados)
         return dados
     except Exception as e:
-        print(f" Erro ao obter detalhes: {e}")
-        return {}
+        raise RuntimeError(f"Erro ao obter detalhes: {e}") from e
 
 
 
@@ -189,16 +206,19 @@ def _coletar_detalhe(cod_marca, nome_marca, cod_modelo, nome_modelo, cod_ano):
             "sigla_combustivel": detalhe.get("SiglaCombustivel"),
             "data_consulta": detalhe.get("DataConsulta")
         }
-    except requests.RequestException as e:
-        print(f"\n API Error [{nome_marca} {nome_modelo}]: {e}")
-        return None
     except Exception as e:
-        print(f"\n Unexpected error [{nome_marca} {nome_modelo}]: {e}")
-        return None
+        raise RuntimeError(f"Erro na coleta de {nome_marca} {nome_modelo}: {e}") from e
 
 
 def _drain_futures(futures, registros, limite_registros, progress_callback=None):
-    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+    done, _ = wait(futures, timeout=2, return_when=FIRST_COMPLETED)
+    if not done:
+        _emit(
+            progress_callback, "api_wait",
+            f"Aguardando {len(futures)} consultas da API; "
+            f"{len(registros)}/{limite_registros} registros coletados",
+            current=len(registros), total=limite_registros,
+        )
     for future in done:
         futures.remove(future)
         resultado = future.result()
@@ -219,100 +239,72 @@ def _drain_futures(futures, registros, limite_registros, progress_callback=None)
 
 
 def coletar_dados_fipe(limite_registros=600, progress_callback=None):
+    if limite_registros <= 0:
+        raise ValueError("O limite de registros deve ser maior que zero")
     registros = []
-    marcas = obter_marcas()
-
+    futures = []
     _emit(
-        progress_callback,
-        "collect_start",
+        progress_callback, "collect_start",
         f"Coletando dados da API FIPE (limite: {limite_registros})",
-        current=0,
-        total=limite_registros,
+        current=0, total=limite_registros,
     )
+    try:
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor, ThreadPoolExecutor(max_workers=1) as metadata:
+            def consultar(operation, *args):
+                return _await_api(metadata, operation, args, registros, limite_registros, progress_callback)
 
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        futures = []
-        for marca_index, marca in enumerate(marcas, start=1):
-            cod_marca = marca.get("codigo")
-            nome_marca = marca.get("nome")
-            _emit(
-                progress_callback,
-                "brand",
-                f"Processando marca {marca_index}/{len(marcas)}: {nome_marca}",
-                current=len(registros),
-                total=limite_registros,
-                brand=nome_marca,
-            )
-
-            modelos = obter_modelos(cod_marca)
-            for modelo in modelos:
-                cod_modelo = modelo["codigo"]
-                nome_modelo = modelo["nome"]
-
-                anos = obter_anos(cod_marca, cod_modelo)
-                if not anos:
-                    continue
-
-                for ano in anos:
-                    cod_ano = ano["codigo"] if isinstance(ano, dict) else ano
-                    futures.append(
-                        executor.submit(
-                            _coletar_detalhe,
-                            cod_marca,
-                            nome_marca,
-                            cod_modelo,
-                            nome_modelo,
-                            cod_ano
-                        )
+            def tarefas():
+                marcas = consultar(obter_marcas)
+                for marca_index, marca in enumerate(marcas, start=1):
+                    cod_marca, nome_marca = marca.get("codigo"), marca.get("nome")
+                    _emit(
+                        progress_callback, "brand",
+                        f"Processando marca {marca_index}/{len(marcas)}: {nome_marca}",
+                        current=len(registros), total=limite_registros, brand=nome_marca,
                     )
-
-                    if len(futures) >= _MAX_WORKERS * 4:
-                        limite_atingido = _drain_futures(
-                            futures,
-                            registros,
-                            limite_registros,
-                            progress_callback,
+                    for modelo in consultar(obter_modelos, cod_marca):
+                        cod_modelo, nome_modelo = modelo["codigo"], modelo["nome"]
+                        _emit(
+                            progress_callback, "model",
+                            f"Consultando anos de {nome_marca} {nome_modelo}; "
+                            f"{len(registros)}/{limite_registros} registros coletados",
+                            current=len(registros), total=limite_registros,
                         )
-                        if limite_atingido:
-                            _emit(
-                                progress_callback,
-                                "collect_limit",
-                                f"Limite de {limite_registros} registros atingido",
-                                current=len(registros),
-                                total=limite_registros,
-                            )
-                            _save_cache()
-                            return pd.DataFrame(registros)
+                        for ano in consultar(obter_anos, cod_marca, cod_modelo):
+                            cod_ano = ano["codigo"] if isinstance(ano, dict) else ano
+                            yield cod_marca, nome_marca, cod_modelo, nome_modelo, cod_ano
 
-        while futures:
-            limite_atingido = _drain_futures(
-                futures,
-                registros,
-                limite_registros,
-                progress_callback,
-            )
-            if limite_atingido:
-                _emit(
-                    progress_callback,
-                    "collect_limit",
-                    f"Limite de {limite_registros} registros atingido",
-                    current=len(registros),
-                    total=limite_registros,
-                )
-                _save_cache()
-                return pd.DataFrame(registros)
+            try:
+                for args in tarefas():
+                    futures.append(executor.submit(_coletar_detalhe, *args))
+                    while len(futures) >= _MAX_WORKERS:
+                        if _drain_futures(futures, registros, limite_registros, progress_callback):
+                            break
+                    if len(registros) >= limite_registros:
+                        break
+                while futures and len(registros) < limite_registros:
+                    _drain_futures(futures, registros, limite_registros, progress_callback)
+            finally:
+                for future in futures:
+                    future.cancel()
+                if any(not future.done() for future in futures):
+                    _emit(
+                        progress_callback, "api_wait",
+                        "Encerrando consultas em andamento antes de finalizar a coleta; "
+                        f"{len(registros)}/{limite_registros} registros coletados",
+                        current=len(registros), total=limite_registros,
+                    )
+    finally:
+        # Workers must finish before their newly fetched responses are persisted.
+        _save_cache()
 
-    _save_cache()
-    df = pd.DataFrame(registros)
+    reached_limit = len(registros) >= limite_registros
     _emit(
-        progress_callback,
-        "collect_done",
-        f"Total de registros coletados: {len(df)}",
-        current=len(df),
-        total=limite_registros,
+        progress_callback, "collect_limit" if reached_limit else "collect_done",
+        f"Coleta encerrada: {len(registros)}/{limite_registros} registros coletados",
+        current=len(registros), total=limite_registros,
     )
-    return df
-
+    return pd.DataFrame(registros)
 
 
 def _limpar_valor(valor):

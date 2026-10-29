@@ -170,7 +170,7 @@ def pipeline_progress_ratio(update):
 
     if event == "start":
         return 0.02
-    if event in {"collect_start", "brand", "records", "collect_limit", "collect_done"}:
+    if event in {"collect_start", "brand", "model", "api_wait", "records", "collect_limit", "collect_done"}:
         return min(0.78, 0.08 + (current / total) * 0.70)
     if event == "save_start":
         return 0.82
@@ -271,7 +271,13 @@ def render_pipeline_action():
             log_output.code("\n".join(logs[-18:]), language="text")
 
         with st.status("Pipeline em execucao", expanded=True) as status:
-            summary = importar_dados_fipe(limite_registros=int(limit), progress_callback=on_progress)
+            try:
+                summary = importar_dados_fipe(limite_registros=int(limit), progress_callback=on_progress)
+            except Exception as exc:
+                status.update(label="Pipeline interrompido", state="error")
+                current_step.error(str(exc))
+                st.error("A coleta nao foi concluida. Verifique a mensagem acima antes de tentar novamente.")
+                return
             cached_data.clear()
             status.update(label="Pipeline concluido", state="complete")
 
